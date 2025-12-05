@@ -1,0 +1,10 @@
+[project]
+name = "cube2icc"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "colour-science>=0.4.6",
+    "numpy>=2.3.5",
+]
