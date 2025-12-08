@@ -5,7 +5,7 @@ CUBE to ICC Converter
 
 import sys
 import struct
-import datetime
+import argparse
 from pathlib import Path
 
 # Check for numpy
@@ -22,53 +22,12 @@ except ImportError:
     print("错误: 需要安装 pillow 库 (pip install pillow)")
     sys.exit(1)
 
-# --- 色彩数学核心 (RGB -> XYZ -> Lab) ---
-
-class ColorMath:
-    # D50 White Point for Lab conversion
-    Xn, Yn, Zn = 0.9642, 1.0000, 0.8249
-
-    # sRGB to XYZ (D50) Matrix
-    M_RGB_XYZ = np.array([
-        [0.4360747, 0.3850649, 0.1430804],
-        [0.2225045, 0.7168786, 0.0606169],
-        [0.0139322, 0.0971045, 0.7141733]
-    ])
-
-    @staticmethod
-    def rgb_to_lab(rgb_block):
-        """
-        Convert sRGB (0-1) to Lab (D50)
-        L: 0..100, a: -128..127, b: -128..127
-        """
-        # 1. Linearize sRGB
-        mask = rgb_block <= 0.04045
-        lin = np.empty_like(rgb_block)
-        lin[mask] = rgb_block[mask] / 12.92
-        lin[~mask] = ((rgb_block[~mask] + 0.055) / 1.055) ** 2.4
-
-        # 2. To XYZ
-        xyz = np.dot(lin, ColorMath.M_RGB_XYZ.T)
-
-        # 3. To Lab
-        # Scale relative to Tristimulus (D50)
-        xyz[:, 0] /= ColorMath.Xn
-        xyz[:, 1] /= ColorMath.Yn
-        xyz[:, 2] /= ColorMath.Zn
-
-        # F(t) function
-        mask_xyz = xyz > 0.008856
-        f_xyz = np.empty_like(xyz)
-        f_xyz[mask_xyz] = np.cbrt(xyz[mask_xyz])
-        f_xyz[~mask_xyz] = (7.787 * xyz[~mask_xyz]) + (16.0 / 116.0)
-
-        # Calculate L, a, b
-        lab = np.empty_like(xyz)
-        lab[:, 0] = 116.0 * f_xyz[:, 1] - 16.0
-        lab[:, 1] = 500.0 * (f_xyz[:, 0] - f_xyz[:, 1])
-        lab[:, 2] = 200.0 * (f_xyz[:, 1] - f_xyz[:, 2])
-
-        return lab
+# Check for colour-science
+try:
+    import colour
+except ImportError:
+    print("错误: 需要安装 colour-science 库 (pip install colour-science)")
+    sys.exit(1)
 
 # --- 辅助工具 ---
 
@@ -183,8 +142,9 @@ class ICCParser:
     def parse(self):
         try:
             with open(self.filepath, 'rb') as f:
-                self.header = bytearray(f.read(128))
-                if len(self.header) < 128: return False
+                header = bytearray(f.read(128))
+                if len(header) < 128: return False
+                self.header = header
                 
                 # Read Tag Table
                 tag_count_bytes = f.read(4)
@@ -199,7 +159,6 @@ class ICCParser:
                     self.tags.append({'sig': sig, 'offset': offset, 'size': size})
                 
                 # Read Tag Data
-                # We read the whole file content to extract data chunks easily
                 f.seek(0)
                 full_content = f.read()
                 
@@ -214,119 +173,208 @@ class ICCParser:
             print(f"读取 ICC 失败: {e}")
             return False
 
-# --- ICC Writer (Modified for Base Profile Injection) ---
+# --- ICC Writer (With Colour Science Support) ---
 
 class ICCWriter:
-    def __init__(self, cube_data, title, base_profile_path=None, base_profile_data=None):
+    def __init__(self, cube_data, title, base_profile_path=None, base_profile_data=None, 
+                 target_gamut='sRGB', target_curve='sRGB',
+                 lut_output_gamut='sRGB', lut_output_curve='sRGB'):
         self.lut = cube_data
         self.size = cube_data.shape[0]
         self.title = title
         self.base_profile_path = base_profile_path
         self.base_profile_data = base_profile_data # (header, tags) tuple
+        
+        # Color Management Parameters
+        self.target_gamut_name = target_gamut
+        self.target_curve_name = target_curve
+        self.lut_output_gamut_name = lut_output_gamut
+        self.lut_output_curve_name = lut_output_curve
 
     def create_profile(self, output_path):
         print("正在构建色彩转换链路...")
+        print(f"  Target Space: {self.target_gamut_name} / {self.target_curve_name}")
+        print(f"  LUT Output Space: {self.lut_output_gamut_name} / {self.lut_output_curve_name}")
         
         # Target Grid Size for ICC (33 is standard)
         grid_size = 33
         
         # 1. Generate Input Grid (Camera RGB Linear)
-        # Shape: (33, 33, 33, 3) -> (B, G, R) order for iteration, but we need (R, G, B) for CMS
-        # Let's create standard meshgrid
         x = np.linspace(0, 1, grid_size)
-        # Meshgrid 'ij' indexing: z, y, x
-        # Note: We need to be careful with channel order.
-        # ICC CLUT input is usually RGB.
-        # Let's generate (R, G, B) coordinates.
-        rr, gg, bb = np.meshgrid(x, x, x, indexing='ij')
-        # Flatten to (N, 3)
-        # Order: We want to iterate R, then G, then B (or B, G, R depending on ICC packing)
-        # Actually ICC CLUT is usually packed such that last component varies fastest.
-        # But let's stick to a flat list of pixels for CMS.
-        
-        # Let's use (B, G, R) order to match our LUT logic, then flip for CMS if needed.
-        # Wait, CUBE is B, G, R (Z, Y, X).
-        # ICC A2B0 input is usually R, G, B.
-        # Let's generate R, G, B grid.
-        
-        # Create (N, 3) array of RGB values
-        # We need to match the order expected by the CLUT writing loop later.
-        # The CLUT writing loop usually expects: R varies fastest? No, usually B varies fastest in memory.
-        # Let's check _make_mft2 packing.
-        # It takes `clut_u16` which is passed from `flat_lab`.
-        # `flat_lab` comes from `lut_transposed`.
-        # Previously: `lut_transposed = self.lut.transpose(2, 1, 0, 3)` -> (R, G, B)
-        # So we need to generate a grid that corresponds to (R, G, B) structure.
-        
-        rr, gg, bb = np.meshgrid(x, x, x, indexing='ij') 
-        # If we transpose to (2, 1, 0), we get R, G, B order where B varies fastest?
-        # Let's just generate a flat list of all grid points in the order we want to write them.
-        # We want to write a 3D table where index [r, g, b] maps to output.
-        # So we need to evaluate the pipeline for every [r, g, b] combination.
         
         # Generate coordinates for (R, G, B)
-        # R: 0..32, G: 0..32, B: 0..32
-        # We want an array where the first dimension corresponds to R, second to G, third to B.
+        # We need an array where we can iterate through all combinations
         grid_points = np.zeros((grid_size, grid_size, grid_size, 3), dtype=np.float32)
         for r in range(grid_size):
             for g in range(grid_size):
                 for b in range(grid_size):
                     grid_points[r, g, b] = [x[r], x[g], x[b]]
                     
-        # Flatten for processing
         flat_camera_rgb = grid_points.reshape(-1, 3)
         
-        # 2. Camera RGB -> sRGB (using Base Profile)
+        # 2. Camera RGB -> sRGB (via ImageCms)
+        # We start by converting the Camera RGB (defined by base profile) to sRGB.
+        # This gives us a known starting point for colour-science.
+        
+        flat_srgb = flat_camera_rgb # Default fallback
+        
         if self.base_profile_path:
-            print("应用基础 ICC 转换 (Camera -> sRGB)...")
-            # Create sRGB profile (built-in)
+            print("  Step: Camera -> sRGB (ImageCms)...")
             srgb_profile = ImageCms.createProfile("sRGB")
-            
-            # Create Transform: Base -> sRGB
-            # Intent: Relative Colorimetric (usually best for input -> display)
             try:
+                # Intent: Relative Colorimetric
                 transform = ImageCms.buildTransform(self.base_profile_path, srgb_profile, "RGB", "RGB", renderingIntent=1)
                 
-                # Convert to 8-bit for PIL (ImageCms works best with images)
-                # Note: This might lose some precision, but it's standard for this flow.
-                # Alternatively, use floating point if supported, but PIL CMS is often 8-bit.
+                # Input to ImageCms must be u8 usually for simple usage, or handle float bytes.
+                # Standard ImageCms works well with PIL Images.
                 img_in = Image.fromarray((flat_camera_rgb * 255).astype(np.uint8).reshape(1, -1, 3))
                 img_out = ImageCms.applyTransform(img_in, transform)
                 
-                # Back to float 0..1
+                # Back to float 0..1 (Gamma Encoded sRGB)
                 flat_srgb = np.array(img_out).reshape(-1, 3) / 255.0
                 
             except Exception as e:
                 print(f"⚠️ CMS 转换失败: {e}")
                 print("回退到直接映射...")
                 flat_srgb = flat_camera_rgb
-        else:
-            flat_srgb = flat_camera_rgb
+        
+        # 3. sRGB (Gamma) -> XYZ -> Target (Linear) -> Target (Log)
+        print(f"  Step: sRGB -> {self.target_gamut_name} (Log: {self.target_curve_name})...")
+        
+        # sRGB (Gamma) -> sRGB (Linear)
+        try:
+             flat_srgb_linear = colour.cctf_decoding(flat_srgb, function='sRGB')
+        except ValueError: # fallback for newer colour versions requiring different name
+             flat_srgb_linear = colour.sRGB_to_XYZ(flat_srgb) # This goes to XYZ directly if needed, but let's stick to decoding
+             # Actually sRGB decoding is standard.
+             pass
 
-        # 3. Apply LUT (sRGB -> LUT -> sRGB/Modified)
-        print("应用 3D LUT...")
-        # LUT expects B, G, R coordinates (0..Size-1)
-        # Our flat_srgb is R, G, B.
-        # So we need to feed [B, G, R] to interpolator.
+        exposure_compensation_stops = 1.1
+        linear_gain = 2.0 ** exposure_compensation_stops
         
-        lut_coords = flat_srgb[:, ::-1] * (self.size - 1) # Flip to BGR and scale
+        print(f"  Fix: Applying Pre-Gain {linear_gain:.2f}x (+{exposure_compensation_stops} EV)...")
+        flat_srgb_linear = flat_srgb_linear * linear_gain
+
+        if self.target_curve_name == 'sRGB':
+            contrast_strength = 1.1  # 1.0=平, 1.2=标准, 1.4=强
+            temp_gamma = flat_srgb_linear ** (1/2.2)
+            temp_gamma = (temp_gamma - 0.5) * contrast_strength + 0.5
+            temp_gamma = np.clip(temp_gamma, 0.0, 1.0) 
+            flat_srgb_linear = temp_gamma ** 2.2
+
+        # sRGB (Linear) -> XYZ (D50 adapted)
+        # Colour science sRGB -> XYZ is usually D65.
+        # We need to be careful with white points.
+        # ImageCms sRGB profile is likely D50 adapted (standard ICC PCS).
+        # However, let's assume the sRGB values we got are standard D65 sRGB values.
+        # So we convert sRGB(Linear) -> XYZ(D65) -> XYZ(Target WP) -> Target RGB(Linear)
         
+        srgb_cs = colour.RGB_COLOURSPACES['sRGB']
+        XYZ = colour.RGB_to_XYZ(flat_srgb_linear, 
+                                srgb_cs.whitepoint,
+                                srgb_cs.whitepoint,
+                                srgb_cs.matrix_RGB_to_XYZ)
+                                
+        # XYZ -> Target RGB (Linear)
+        # We need to know the target gamut whitepoint
+        try:
+            target_cs = colour.RGB_COLOURSPACES[self.target_gamut_name]
+        except KeyError:
+            print(f"❌ Error: Gamut '{self.target_gamut_name}' not found.")
+            return False
+            
+        # If target uses different whitepoint, RGB_to_RGB handles chromatic adaptation
+        flat_target_linear = colour.RGB_to_RGB(flat_srgb_linear,
+                                               srgb_cs,
+                                               target_cs)
+                                               
+        # Target RGB (Linear) -> Target RGB (Log/Encoded)
+        # Note: colour.cctf_encoding expects linear input
+        try:
+            # First try specific name if it exists in cctf_encoding
+            flat_target_log = colour.cctf_encoding(flat_target_linear, function=self.target_curve_name)
+        except ValueError:
+            # Fallback for some curves that might be named differently or strictly OETFs
+            try: 
+                 # Some curves are OETFs strictly
+                 flat_target_log = colour.oetf(flat_target_linear, function=self.target_curve_name)
+            except:
+                 print(f"❌ Error: Curve '{self.target_curve_name}' not found.")
+                 return False
+
+        # flat_target_log = np.nan_to_num(flat_target_log)
+        # flat_target_log = np.clip(flat_target_log, 0.0, 1.0)
+
+        # 4. Apply LUT
+        print("  Step: Applying 3D LUT...")
+        # LUT expects B, G, R coordinates
+        lut_coords = flat_target_log[:, ::-1] * (self.size - 1)
         interpolator = TrilinearInterpolator(self.lut)
-        flat_lut_out = interpolator(lut_coords) # Result is (N, 3) RGB
+        flat_lut_out = interpolator(lut_coords) # Result is (N, 3)
         
-        # 4. Convert to Lab (D50)
-        print("转换到 Lab (D50)...")
-        flat_lut_out = np.clip(flat_lut_out, 0.0, 1.0)
-        flat_lab = ColorMath.rgb_to_lab(flat_lut_out)
+        # 5. LUT Output -> Lab (D50)
+        # We need to interpret what the LUT output IS.
+        # defined by lut_output_gamut and lut_output_curve.
         
-        # 5. Encode to ICC uint16
+        print(f"  Step: LUT Output ({self.lut_output_gamut_name}/{self.lut_output_curve_name}) -> Lab...")
+        
+        # LUT Out (Log/Gamma) -> Linear
+        try:
+            flat_out_linear = colour.cctf_decoding(flat_lut_out, function=self.lut_output_curve_name)
+        except ValueError:
+             try:
+                 flat_out_linear = colour.eotf(flat_lut_out, function=self.lut_output_curve_name)
+             except:
+                 print(f"❌ Error: Curve '{self.lut_output_curve_name}' not found for decoding.")
+                 return False
+                 
+        # Linear -> XYZ (D50)
+        # We need final XYZ to be D50 for ICC Lab conversion.
+        try:
+            output_cs = colour.RGB_COLOURSPACES[self.lut_output_gamut_name]
+        except KeyError:
+             print(f"❌ Error: Gamut '{self.lut_output_gamut_name}' not found.")
+             return False
+
+        
+        # Calculate Matrix RGB -> XYZ(D50)
+        # If current WP is not D50, we adapt to D50.
+        D50 = colour.CCS_ILLUMINANTS['CIE 1931 2 Degree Standard Observer']['D50']
+        
+        # We can use RGB_to_XYZ directly specifying illuminant if supported, 
+        # but RGB_to_XYZ generally returns XYZ relative to the RGB space's whitepoint.
+        # So we convert RGB -> XYZ(Native) -> XYZ(D50)
+        
+        XYZ_out = colour.RGB_to_XYZ(flat_out_linear,
+                                    output_cs.whitepoint,
+                                    output_cs.whitepoint,
+                                    output_cs.matrix_RGB_to_XYZ)
+                                    
+        # Chromatic Adaptation XYZ(Native) -> XYZ(D50)
+        if not np.allclose(output_cs.whitepoint, D50, atol=1e-3):
+            # Convert xy to XYZ for adaptation function
+            XYZ_current_wp = colour.xy_to_XYZ(output_cs.whitepoint)
+            XYZ_D50_wp = colour.xy_to_XYZ(D50)
+            # Using CAT02 by default usually
+            XYZ_D50 = colour.adaptation.chromatic_adaptation_VonKries(XYZ_out, XYZ_current_wp, XYZ_D50_wp)
+        else:
+            XYZ_D50 = XYZ_out
+            
+        # XYZ(D50) -> Lab
+        flat_lab = colour.XYZ_to_Lab(XYZ_D50, illuminant=D50)
+        
+        # 6. Encode to ICC uint16
         lab_u16 = np.empty_like(flat_lab, dtype=np.uint16)
+        # Lab in ICC is: L scaled 0..100 -> 0..65535, a,b scaled -128..127
+        # Wait, standard ICC Lab encoding (v2/v4 mft2) usually:
+        # L: 0.0 -> 0x0000, 100.0 -> 0xFFFF (so * 655.35)
+        # a: -128 -> 0x0000, 0 -> 0x8000, 127 -> 0xFFFF (offset 128, mul 256)
+        
         lab_u16[:, 0] = np.clip(flat_lab[:, 0] * 655.35, 0, 65535).astype(np.uint16)
         lab_u16[:, 1] = np.clip((flat_lab[:, 1] + 128.0) * 256.0, 0, 65535).astype(np.uint16)
         lab_u16[:, 2] = np.clip((flat_lab[:, 2] + 128.0) * 256.0, 0, 65535).astype(np.uint16)
         
-        # 6. Build Tags
-        # Note: We pass grid_size to _make_mft2 because we generated a 33x33x33 grid
+        # 7. Build Tags
         a2b0_data = self._make_mft2(lab_u16, grid_size)
         
         final_tags = []
@@ -350,13 +398,13 @@ class ICCWriter:
             self._write_file(output_path, final_tags, base_header)
             
         else:
-            # Fallback
+            # Fallback (Generic Header)
             rXYZ = (0.4360747, 0.2225045, 0.0139322)
             gXYZ = (0.3850649, 0.7168786, 0.0971045)
             bXYZ = (0.1430804, 0.0606169, 0.7141733)
 
             final_tags = [
-                (b'desc', self._make_desc(f"{self.title} (Monitor)")),
+                (b'desc', self._make_desc(f"{self.title} (Target: {self.target_curve_name})")),
                 (b'cprt', b'text\x00\x00\x00\x00CUBE-ICC\x00'),
                 (b'wtpt', struct.pack('>3i', s15Fixed16Number(0.9642), s15Fixed16Number(1.0), s15Fixed16Number(0.8249))),
                 (b'rXYZ', self._make_xyz(rXYZ)),
@@ -378,8 +426,6 @@ class ICCWriter:
                            s15Fixed16Number(xyz_tuple[2]))
 
     def _make_trc(self, gamma):
-        # 'curv' type
-        # Count = 1 (gamma value), value is u8.8
         gamma_val = int(round(gamma * 256.0))
         return b'curv\x00\x00\x00\x00\x00\x00\x00\x01' + struct.pack('>H', gamma_val)
 
@@ -389,16 +435,13 @@ class ICCWriter:
         header += struct.pack('>9i', s15Fixed16Number(1),0,0,0,s15Fixed16Number(1),0,0,0,s15Fixed16Number(1)) # Matrix
         header += struct.pack('>2H', 256, 256) # Table entries
         
-        # Input Table: Identity (Linear)
-        # Since we handled the Camera -> sRGB conversion in the CLUT data itself,
-        # the input to the A2B0 tag (which is Camera RGB) should be passed through linearly
-        # to our CLUT which now encodes the full transform.
+        # Input Table: Identity
         ramp = np.linspace(0, 65535, 256, dtype=np.uint16).astype('>u2').tobytes()
         input_tbl = ramp * 3
         
         clut_bytes = clut_u16.astype('>u2').tobytes()
         
-        # Output Table: Linear (Identity)
+        # Output Table: Identity
         output_tbl = ramp * 3
         
         return header + input_tbl + clut_bytes + output_tbl
@@ -426,21 +469,59 @@ class ICCWriter:
         # Build Header
         size = header_size + table_size + len(data_bytes)
         
-        head = bytearray(base_header)
-        # Update size in header
+        if base_header:
+            head = bytearray(base_header)
+        else:
+             # Minimal valid header if no base provided
+             head = bytearray(128)
+             head[0:4] = struct.pack('>I', size)
+             head[12:16] = b'mntr' # Class: Monitor
+             head[16:20] = b'RGB ' # Data Space
+             head[20:24] = b'XYZ ' # PCS
+             head[64:68] = struct.pack('>I', 0x61637370) # 'acsp' signature
+        
+        # Update size
         head[0:4] = struct.pack('>I', size)
         
         with open(path, 'wb') as f:
             f.write(head + table_bytes + data_bytes)
 
-# --- Main ---
+# --- Presets ---
+
+PRESETS = {
+    'F-Log2': {'gamut': 'F-Gamut', 'curve': 'F-Log2'},
+    'F-Log':  {'gamut': 'F-Gamut', 'curve': 'F-Log'},
+    'V-Log':  {'gamut': 'V-Gamut', 'curve': 'V-Log'},
+    'S-Log3': {'gamut': 'S-Gamut3.Cine', 'curve': 'S-Log3'}, # Common pairing, though S-Gamut3 also exists
+    'LogC3':  {'gamut': 'Alexa Wide Gamut', 'curve': 'LogC3'},
+    'LogC4':  {'gamut': 'Alexa Wide Gamut 4', 'curve': 'LogC4'},
+}
 
 def main():
-    if len(sys.argv) < 2:
-        print("用法: python3 main.py input.cube")
-        return
-        
-    f = sys.argv[1]
+    parser = argparse.ArgumentParser(description="Convert CUBE LUT to ICC Profile with Color Space Control")
+    parser.add_argument("input_cube", help="Input .cube file")
+    
+    # Target (Inputs to LUT)
+    parser.add_argument("--target-gamut", default="sRGB", help="Target Colour Gamut (e.g. F-Gamut, S-Gamut3, sRGB)")
+    parser.add_argument("--target-curve", default="sRGB", help="Target OETF/Curve (e.g. F-Log2, S-Log3, sRGB)")
+    
+    # LUT Output
+    parser.add_argument("--lut-output-gamut", default="sRGB", help="LUT Output Gamut (default: sRGB)")
+    parser.add_argument("--lut-output-curve", default="sRGB", help="LUT Output Gamma/Curve (default: sRGB)")
+    
+    # Preset
+    parser.add_argument("--preset", choices=PRESETS.keys(), help="Apply preset for Target Gamut/Curve")
+    
+    args = parser.parse_args()
+    
+    # Apply Preset override
+    if args.preset:
+        p = PRESETS[args.preset]
+        args.target_gamut = p['gamut']
+        args.target_curve = p['curve']
+        print(f"应用预设 [{args.preset}]: Gamut={args.target_gamut}, Curve={args.target_curve}")
+
+    f = args.input_cube
     print(f"处理: {f}")
     
     # Base Profile Path
@@ -454,21 +535,23 @@ def main():
             base_profile_data = (parser.header, parser.tags)
     else:
         print(f"⚠️ 未找到基础 ICC: {base_icc_path}")
-        base_icc_path = None # Ensure it's None if not found
         exit(1)
 
     reader = CUBEReader(f)
     if reader.read():
-        # Monitor LUTs are often 17, 33, or 65.
-        # 33 is a good balance for ICC file size.
         if reader.size != 33: reader.data = reader.resample(33)
         
         out = Path(f).with_suffix('.icc')
-        writer = ICCWriter(reader.data, reader.title, base_icc_path, base_profile_data)
+        writer = ICCWriter(reader.data, reader.title, base_icc_path, base_profile_data,
+                           target_gamut=args.target_gamut,
+                           target_curve=args.target_curve,
+                           lut_output_gamut=args.lut_output_gamut,
+                           lut_output_curve=args.lut_output_curve)
+                           
         if writer.create_profile(str(out)):
             print(f"✅ 生成完毕: {out}")
             if base_profile_data:
-                print("类型: 基于 FujiXT5-Generic 修改 (含 Camera->sRGB 转换)")
+                print("类型: 基于 FujiXT5-Generic 修改 (含 Camera->Target 转换)")
         else:
             print("❌ 生成失败")
             exit(1)
