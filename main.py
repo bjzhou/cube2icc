@@ -249,19 +249,6 @@ class ICCWriter:
              # Actually sRGB decoding is standard.
              pass
 
-        exposure_compensation_stops = 1.1
-        linear_gain = 2.0 ** exposure_compensation_stops
-        
-        print(f"  Fix: Applying Pre-Gain {linear_gain:.2f}x (+{exposure_compensation_stops} EV)...")
-        flat_srgb_linear = flat_srgb_linear * linear_gain
-
-        if self.target_curve_name == 'sRGB':
-            contrast_strength = 1.1  # 1.0=平, 1.2=标准, 1.4=强
-            temp_gamma = flat_srgb_linear ** (1/2.2)
-            temp_gamma = (temp_gamma - 0.5) * contrast_strength + 0.5
-            temp_gamma = np.clip(temp_gamma, 0.0, 1.0) 
-            flat_srgb_linear = temp_gamma ** 2.2
-
         # sRGB (Linear) -> XYZ (D50 adapted)
         # Colour science sRGB -> XYZ is usually D65.
         # We need to be careful with white points.
@@ -311,7 +298,9 @@ class ICCWriter:
         lut_coords = flat_target_log[:, ::-1] * (self.size - 1)
         interpolator = TrilinearInterpolator(self.lut)
         flat_lut_out = interpolator(lut_coords) # Result is (N, 3)
-        
+
+        flat_lut_out = self.apply_gamma_s_curve(flat_lut_out, gamma=2.2, contrast=1.0/1.3)
+
         # 5. LUT Output -> Lab (D50)
         # We need to interpret what the LUT output IS.
         # defined by lut_output_gamut and lut_output_curve.
@@ -418,6 +407,39 @@ class ICCWriter:
             self._write_file(output_path, final_tags)
             
         return True
+    
+    def apply_gamma_s_curve(self, arr, gamma=2.2, contrast=1.0):
+        """
+        模拟标准曲线：先 Gamma, 再 S 曲线，再反 Gamma (为了保持线性工作流)
+        contrast > 1.0 : 增加对比 (模拟 Adobe Standard / Film Standard)
+        contrast < 1.0 : 降低对比 (模拟 Inverse Curve)
+        """
+        # 1. 转换到感知域 (Gamma 编码)
+        # 加上极小值防止 0 的导数问题
+        enc = np.power(np.maximum(arr, 0), 1/gamma)
+        
+        # 2. 应用 S 曲线 (以 0.5 为轴心)
+        # 使用 arctan 模拟平滑的 S 曲线 (Sigmoid)
+        # 公式: 归一化(arctan((x-0.5)*contrast))
+        
+        x = enc - 0.5
+        
+        # 这种 S 曲线算法是可逆的，且非常接近胶片响应
+        # 预计算归一化因子
+        norm_factor = np.arctan(0.5 * contrast) * 2.0
+        
+        # 应用
+        if contrast != 1.0:
+            y = np.arctan(x * contrast) * 2.0 / norm_factor
+            y = y * 0.5 + 0.5
+        else:
+            y = enc
+            
+        # Clip 保护
+        y = np.clip(y, 0, 1)
+        
+        # 3. 转换回线性域
+        return np.power(y, gamma)
 
     def _make_xyz(self, xyz_tuple):
         return struct.pack('>3i', 
@@ -512,6 +534,11 @@ def main():
     # Preset
     parser.add_argument("--preset", choices=PRESETS.keys(), help="Apply preset for Target Gamut/Curve")
     
+    # Base Profile
+    default_base_icc = '/Applications/Capture One.app/Contents/Frameworks/ImageProcessing.framework/Versions/A/Resources/Profiles/Input/SonyA7CM2-ProStandard.icm'
+    # default_base_icc = '/Applications/Capture One.app/Contents/Frameworks/ImageProcessing.framework/Versions/A/Resources/Profiles/Input/FujiXT5-Generic.icm'
+    parser.add_argument("--base-icc", default=default_base_icc, help=f"Base ICC Profile path (default: {default_base_icc})")
+
     args = parser.parse_args()
     
     # Apply Preset override
@@ -525,7 +552,7 @@ def main():
     print(f"处理: {f}")
     
     # Base Profile Path
-    base_icc_path = '/Applications/Capture One.app/Contents/Frameworks/ImageProcessing.framework/Versions/A/Resources/Profiles/Input/FujiXT5-Generic.icm'
+    base_icc_path = args.base_icc
     base_profile_data = None
     
     if Path(base_icc_path).exists():
@@ -541,7 +568,20 @@ def main():
     if reader.read():
         if reader.size != 33: reader.data = reader.resample(33)
         
-        out = Path(f).with_suffix('.icc')
+        # Construct Output Filename: {CameraModel}-{LUTName}.icc
+        # Example: SonyA7CM2-ProStandard.icm + FujiNC.cube -> SonyA7CM2-FujiNC.icc
+        
+        base_stem = Path(base_icc_path).stem
+        # Heuristic: Take part before the last dash as the model name
+        # If no dash, use the whole stem
+        if '-' in base_stem:
+            camera_model = base_stem.rpartition('-')[0]
+        else:
+            camera_model = base_stem
+            
+        lut_name = Path(f).stem
+        out_filename = f"{camera_model}-{lut_name}.icc"
+        out = Path(f).parent / out_filename
         writer = ICCWriter(reader.data, reader.title, base_icc_path, base_profile_data,
                            target_gamut=args.target_gamut,
                            target_curve=args.target_curve,
@@ -550,8 +590,6 @@ def main():
                            
         if writer.create_profile(str(out)):
             print(f"✅ 生成完毕: {out}")
-            if base_profile_data:
-                print("类型: 基于 FujiXT5-Generic 修改 (含 Camera->Target 转换)")
         else:
             print("❌ 生成失败")
             exit(1)
