@@ -25,6 +25,15 @@
     *   ARRI LogC3 / LogC4
 *   **高质量插值**：使用 Numpy 实现三线性插值（Trilinear Interpolation），确保色彩转换的平滑性。
 
+## 📸 效果示例 (Examples)
+
+|                                                                |                                                             |                                                                   |
+|:--------------------------------------------------------------:|:-----------------------------------------------------------:|:-----------------------------------------------------------------:|
+|    ![Screenshots](art/screenshot_c1.png)<br>**Screenshots**    |        ![Original](art/_DSC2744.jpg)<br>**Original**        | 
+|              ![NC](art/_DSC2744NC.jpg)<br>**NC**               |             ![CC](art/_DSC2744CC.jpg)<br>**CC**             |          ![PROVIA](art/_DSC2744PROVIA.jpg)<br>**PROVIA**          |
+|             ![FL3](art/_DSC2744FL3.jpg)<br>**FL3**             |           ![VV2](art/_DSC2744VV2.jpg)<br>**VV2**            | ![PositiveFilm](art/_DSC2744PositiveFilm.jpg)<br>**PositiveFilm** |
+| ![Portrait160](art/_DSC2744Portrait160.jpg)<br>**Portrait160** | ![Ektachrome](art/_DSC2744Ektachrome.jpg)<br>**Ektachrome** |        ![Gold200](art/_DSC2744Gold200.jpg)<br>**Gold200**         |
+
 ## 🛠️ 依赖库 (Dependencies)
 
 本项目依赖以下 Python 库：
@@ -68,6 +77,7 @@ python main.py input_cube_file [options]
 | `--target-curve` | LUT 设计时预期的输入曲线 (OETF) | `sRGB` |
 | `--lut-output-gamut` | LUT 输出的色彩空间 | `sRGB` |
 | `--lut-output-curve` | LUT 输出的 Gamma 曲线 | `sRGB` |
+| `--gamma` | 中间调亮度校正 (Gamma > 1 提亮, < 1 压暗) | `1.0` (默认不校正) |
 
 ### 示例
 
