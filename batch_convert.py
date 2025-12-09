@@ -33,7 +33,7 @@ def main():
         try:
             # Construct the command
             # Using uv run python as requested
-            cmd = ["uv", "run", "python", "main.py", str(cube_file)]
+            cmd = ["uv", "run", "python", "main.py", str(cube_file), "--gamma", "1"]
             
             # Run the command
             result = subprocess.run(cmd, capture_output=True, text=True)

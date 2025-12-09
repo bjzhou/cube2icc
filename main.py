@@ -178,7 +178,8 @@ class ICCParser:
 class ICCWriter:
     def __init__(self, cube_data, title, base_profile_path=None, base_profile_data=None, 
                  target_gamut='sRGB', target_curve='sRGB',
-                 lut_output_gamut='sRGB', lut_output_curve='sRGB'):
+                 lut_output_gamut='sRGB', lut_output_curve='sRGB',
+                 gamma=1.0):
         self.lut = cube_data
         self.size = cube_data.shape[0]
         self.title = title
@@ -190,6 +191,7 @@ class ICCWriter:
         self.target_curve_name = target_curve
         self.lut_output_gamut_name = lut_output_gamut
         self.lut_output_curve_name = lut_output_curve
+        self.gamma = gamma
 
     def create_profile(self, output_path):
         print("正在构建色彩转换链路...")
@@ -299,7 +301,19 @@ class ICCWriter:
         interpolator = TrilinearInterpolator(self.lut)
         flat_lut_out = interpolator(lut_coords) # Result is (N, 3)
 
-        flat_lut_out = self.apply_gamma_s_curve(flat_lut_out, gamma=2.2, contrast=1.0/1.3)
+        # 应用反向对比度，适配 C1 胶片标准曲线，强度 (经验值 1.25)
+        c1_contrast = 1.25
+        inverse_contrast = 1.0 / c1_contrast
+        x = flat_lut_out - 0.5
+        norm_factor = np.arctan(0.5 * inverse_contrast) * 2.0
+        flat_low_contrast = np.arctan(x * inverse_contrast) * 2.0 / norm_factor
+        flat_low_contrast = flat_low_contrast * 0.5 + 0.5
+        
+        flat_lut_out = np.clip(flat_low_contrast, 0, 1)
+
+        # 提亮中间调 (gamma)
+        if self.gamma != 1.0:
+            flat_lut_out = flat_lut_out ** (1.0 / self.gamma)
 
         # 5. LUT Output -> Lab (D50)
         # We need to interpret what the LUT output IS.
@@ -407,39 +421,6 @@ class ICCWriter:
             self._write_file(output_path, final_tags)
             
         return True
-    
-    def apply_gamma_s_curve(self, arr, gamma=2.2, contrast=1.0):
-        """
-        模拟标准曲线：先 Gamma, 再 S 曲线，再反 Gamma (为了保持线性工作流)
-        contrast > 1.0 : 增加对比 (模拟 Adobe Standard / Film Standard)
-        contrast < 1.0 : 降低对比 (模拟 Inverse Curve)
-        """
-        # 1. 转换到感知域 (Gamma 编码)
-        # 加上极小值防止 0 的导数问题
-        enc = np.power(np.maximum(arr, 0), 1/gamma)
-        
-        # 2. 应用 S 曲线 (以 0.5 为轴心)
-        # 使用 arctan 模拟平滑的 S 曲线 (Sigmoid)
-        # 公式: 归一化(arctan((x-0.5)*contrast))
-        
-        x = enc - 0.5
-        
-        # 这种 S 曲线算法是可逆的，且非常接近胶片响应
-        # 预计算归一化因子
-        norm_factor = np.arctan(0.5 * contrast) * 2.0
-        
-        # 应用
-        if contrast != 1.0:
-            y = np.arctan(x * contrast) * 2.0 / norm_factor
-            y = y * 0.5 + 0.5
-        else:
-            y = enc
-            
-        # Clip 保护
-        y = np.clip(y, 0, 1)
-        
-        # 3. 转换回线性域
-        return np.power(y, gamma)
 
     def _make_xyz(self, xyz_tuple):
         return struct.pack('>3i', 
@@ -531,6 +512,9 @@ def main():
     parser.add_argument("--lut-output-gamut", default="sRGB", help="LUT Output Gamut (default: sRGB)")
     parser.add_argument("--lut-output-curve", default="sRGB", help="LUT Output Gamma/Curve (default: sRGB)")
     
+    # Correction
+    parser.add_argument("--gamma", type=float, default=1.0, help="Gamma correction (default: 1.0, no correction)")
+    
     # Preset
     parser.add_argument("--preset", choices=PRESETS.keys(), help="Apply preset for Target Gamut/Curve")
     
@@ -586,7 +570,8 @@ def main():
                            target_gamut=args.target_gamut,
                            target_curve=args.target_curve,
                            lut_output_gamut=args.lut_output_gamut,
-                           lut_output_curve=args.lut_output_curve)
+                           lut_output_curve=args.lut_output_curve,
+                           gamma=args.gamma)
                            
         if writer.create_profile(str(out)):
             print(f"✅ 生成完毕: {out}")
