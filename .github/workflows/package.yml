@@ -1,0 +1,53 @@
+name: Package Application
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      run: uv python install 3.12
+
+    - name: Install dependencies
+      run: uv sync
+
+    - name: Build macOS Application
+      if: runner.os == 'macOS'
+      run: |
+        uv run pyinstaller --noconfirm --clean --name "Cube2ICC" --windowed gui.py
+
+    - name: Build Windows Application
+      if: runner.os == 'Windows'
+      run: |
+        uv run pyinstaller --noconfirm --clean --name "Cube2ICC" --windowed gui.py
+
+    - name: Upload macOS Artifact
+      if: runner.os == 'macOS'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Cube2ICC-macOS
+        path: dist/Cube2ICC.app
+
+    - name: Upload Windows Artifact
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Cube2ICC-Windows
+        path: dist/Cube2ICC
