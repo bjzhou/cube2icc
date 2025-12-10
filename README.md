@@ -58,7 +58,20 @@ pip install numpy pillow colour-science
 uv sync
 ```
 
+
 ## 🚀 使用方法 (Usage)
+
+### 图形界面 (GUI)
+
+对于不习惯命令行的用户，可以使用图形界面工具：
+
+```bash
+python gui.py
+```
+
+*注意：需要系统安装了 `tkinter` 支持（通常 Python 自带）。*
+
+### 命令行 (CLI)
 
 基本命令行格式：
 

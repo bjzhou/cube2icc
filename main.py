@@ -492,6 +492,7 @@ class ICCWriter:
 # --- Presets ---
 
 PRESETS = {
+    'sRGB': {'gamut': 'sRGB', 'curve': 'sRGB'},
     'F-Log2': {'gamut': 'F-Gamut', 'curve': 'F-Log2'},
     'F-Log':  {'gamut': 'F-Gamut', 'curve': 'F-Log'},
     'V-Log':  {'gamut': 'V-Gamut', 'curve': 'V-Log'},
