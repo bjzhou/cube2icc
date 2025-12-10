@@ -8,3 +8,8 @@ dependencies = [
     "colour-science>=0.4.6",
     "numpy>=2.3.5",
 ]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.17.0",
+]

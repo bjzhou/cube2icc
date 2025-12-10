@@ -71,6 +71,23 @@ python gui.py
 
 *注意：需要系统安装了 `tkinter` 支持（通常 Python 自带）。*
 
+### 打包应用 (Packaging)
+
+如果你想将应用打包成独立的可执行文件（无需安装 Python 环境即可运行），可以使用项目提供的脚本：
+
+**macOS:**
+```bash
+./build_mac_app.sh
+```
+生成的文件位于 `dist/Cube2ICC.app`。
+
+**Windows:**
+直接双击运行 `build_win_app.bat`。
+生成的文件位于 `dist/Cube2ICC/Cube2ICC.exe`。
+
+*注意：打包依赖 `pyinstaller`，请确保已安装：`pip install pyinstaller` 或 `uv add --dev pyinstaller`。*
+
+
 ### 命令行 (CLI)
 
 基本命令行格式：
