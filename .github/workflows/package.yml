@@ -6,6 +6,9 @@ on:
     tags: [ "v*" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build on ${{ matrix.os }}
@@ -32,22 +35,52 @@ jobs:
       if: runner.os == 'macOS'
       run: |
         uv run pyinstaller --noconfirm --clean --name "Cube2ICC" --windowed gui.py
+        cd dist
+        zip -r Cube2ICC-macOS.zip Cube2ICC.app
 
     - name: Build Windows Application
       if: runner.os == 'Windows'
       run: |
         uv run pyinstaller --noconfirm --clean --name "Cube2ICC" --windowed gui.py
+        cd dist
+        7z a Cube2ICC-Windows.zip Cube2ICC
 
     - name: Upload macOS Artifact
       if: runner.os == 'macOS'
       uses: actions/upload-artifact@v4
       with:
         name: Cube2ICC-macOS
-        path: dist/Cube2ICC.app
+        path: dist/Cube2ICC-macOS.zip
 
     - name: Upload Windows Artifact
       if: runner.os == 'Windows'
       uses: actions/upload-artifact@v4
       with:
         name: Cube2ICC-Windows
-        path: dist/Cube2ICC
+        path: dist/Cube2ICC-Windows.zip
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download macOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Cube2ICC-macOS
+          path: artifacts
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Cube2ICC-Windows
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/Cube2ICC-macOS.zip
+            artifacts/Cube2ICC-Windows.zip
+          generate_release_notes: true
